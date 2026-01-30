@@ -1,0 +1,28 @@
+{
+  "name": "mcp-shopify-admin",
+  "version": "1.0.0",
+  "description": "MCP server for Shopify Admin API",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "mcp-shopify-admin": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "inspect": "npx @modelcontextprotocol/inspector node src/index.js"
+  },
+  "keywords": [
+    "mcp",
+    "shopify",
+    "admin-api",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "axios": "^1.7.9",
+    "dotenv": "^17.2.3",
+    "zod": "^3.24.2"
+  }
+}
