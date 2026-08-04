@@ -1,5 +1,7 @@
 import { z } from "zod";
-import { shopifyGraphQL, buildGid, parseGid } from "../shopify/client.js";
+import { shopifyGraphQL, buildGid, parseGid } from "../stores/client.js";
+import { requireStore, isProduction } from "../stores/registry.js";
+import { workflowEngine, OperationType } from "../workflow/engine.js";
 
 /**
  * Format inventory levels response
@@ -71,16 +73,146 @@ function formatInventoryLevels(inventoryLevels, locations, pageInfo, format) {
   return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
 }
 
+// GraphQL Queries
+const LOCATIONS_QUERY = `
+  query GetLocations {
+    locations(first: 50) {
+      edges {
+        node {
+          id
+          name
+        }
+      }
+    }
+  }
+`;
+
+const PRODUCT_VARIANTS_QUERY = `
+  query GetProductVariants($id: ID!) {
+    product(id: $id) {
+      variants(first: 100) {
+        edges {
+          node {
+            id
+            inventoryItem {
+              id
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const INVENTORY_ITEMS_QUERY = `
+  query GetInventoryItems($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on InventoryItem {
+        id
+        sku
+        variant {
+          id
+          title
+          product {
+            id
+            title
+          }
+        }
+        inventoryLevels(first: 50) {
+          edges {
+            node {
+              id
+              location {
+                id
+                name
+              }
+              quantities(names: ["available", "on_hand", "committed", "incoming"]) {
+                name
+                quantity
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const INVENTORY_LEVELS_QUERY = `
+  query GetInventoryLevels($first: Int!, $after: String, $query: String) {
+    inventoryItems(first: $first, after: $after, query: $query) {
+      edges {
+        node {
+          id
+          sku
+          variant {
+            id
+            title
+            product {
+              id
+              title
+            }
+          }
+          inventoryLevels(first: 10) {
+            edges {
+              node {
+                id
+                location {
+                  id
+                  name
+                }
+                quantities(names: ["available", "on_hand", "committed", "incoming"]) {
+                  name
+                  quantity
+                }
+              }
+            }
+          }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
+const INVENTORY_ADJUST_MUTATION = `
+  mutation AdjustInventory($input: InventoryAdjustQuantitiesInput!) {
+    inventoryAdjustQuantities(input: $input) {
+      inventoryAdjustmentGroup {
+        reason
+        changes {
+          name
+          delta
+          quantityAfterChange
+        }
+      }
+      userErrors {
+        field
+        message
+        code
+      }
+    }
+  }
+`;
+
 export function registerInventoryTools(server) {
+  // ============================================
+  // READ TOOLS (require store parameter)
+  // ============================================
+
   // Get Inventory Levels
-  server.tool(
-    "shopify_get_inventory_levels",
+  server.registerTool(
+    "inventory_levels",
     {
-      title: "Get Shopify Inventory Levels",
+      title: "Get Inventory Levels",
       description:
-        "Get inventory levels for products at specific locations. Can filter by location ID or product ID.",
+        "Get inventory levels for products at specific locations. Can filter by location, product, or SKU.",
       inputSchema: {
-        location_id: z.string().optional().describe("Location ID to filter by (numeric ID or full GID)"),
+        store: z.string().describe("Store name (use store_list to see available stores)"),
+        location_id: z.string().optional().describe("Location ID to filter by"),
         product_id: z.string().optional().describe("Product ID to get inventory for all variants"),
         sku: z.string().optional().describe("SKU to search for"),
         limit: z.number().min(1).max(250).default(50).describe("Number of results (1-250)"),
@@ -94,48 +226,16 @@ export function registerInventoryTools(server) {
         openWorldHint: true,
       },
     },
-    async ({ location_id, product_id, sku, limit, cursor, response_format }) => {
-      // First, get locations
-      const locationsQuery = `
-        query GetLocations {
-          locations(first: 50) {
-            edges {
-              node {
-                id
-                name
-              }
-            }
-          }
-        }
-      `;
-      const locationsData = await shopifyGraphQL(locationsQuery);
+    async ({ store, location_id, product_id, sku, limit, cursor, response_format }) => {
+      requireStore(store);
+
+      // Get locations
+      const locationsData = await shopifyGraphQL(store, LOCATIONS_QUERY);
       const locations = locationsData.locations.edges.map((e) => e.node);
 
-      // Build query for inventory items
-      let queryParts = [];
-      if (sku) {
-        queryParts.push(`sku:${sku}`);
-      }
-
-      // If product_id is provided, we need to get inventory items for that product's variants
+      // If product_id is provided, get inventory for that product's variants
       if (product_id) {
-        const productQuery = `
-          query GetProductVariants($id: ID!) {
-            product(id: $id) {
-              variants(first: 100) {
-                edges {
-                  node {
-                    id
-                    inventoryItem {
-                      id
-                    }
-                  }
-                }
-              }
-            }
-          }
-        `;
-        const productData = await shopifyGraphQL(productQuery, {
+        const productData = await shopifyGraphQL(store, PRODUCT_VARIANTS_QUERY, {
           id: buildGid("Product", product_id),
         });
 
@@ -157,79 +257,7 @@ export function registerInventoryTools(server) {
           };
         }
 
-        // Get inventory levels for these items
-        const inventoryQuery = `
-          query GetInventoryLevels($inventoryItemIds: [ID!]!, $locationId: ID) {
-            inventoryItems(first: 100, query: "") {
-              edges {
-                node {
-                  id
-                  sku
-                  variant {
-                    id
-                    title
-                    product {
-                      id
-                      title
-                    }
-                  }
-                  inventoryLevels(first: 50) {
-                    edges {
-                      node {
-                        id
-                        location {
-                          id
-                          name
-                        }
-                        quantities(names: ["available", "on_hand", "committed", "incoming"]) {
-                          name
-                          quantity
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        `;
-
-        // Get inventory items by their IDs
-        const itemsQuery = `
-          query GetInventoryItems($ids: [ID!]!) {
-            nodes(ids: $ids) {
-              ... on InventoryItem {
-                id
-                sku
-                variant {
-                  id
-                  title
-                  product {
-                    id
-                    title
-                  }
-                }
-                inventoryLevels(first: 50) {
-                  edges {
-                    node {
-                      id
-                      location {
-                        id
-                        name
-                      }
-                      quantities(names: ["available", "on_hand", "committed", "incoming"]) {
-                        name
-                        quantity
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        `;
-
-        const itemsData = await shopifyGraphQL(itemsQuery, {
+        const itemsData = await shopifyGraphQL(store, INVENTORY_ITEMS_QUERY, {
           ids: inventoryItemIds,
         });
 
@@ -264,50 +292,14 @@ export function registerInventoryTools(server) {
         return formatInventoryLevels(inventoryLevels, locations, null, response_format);
       }
 
-      // General inventory query with location filter
+      // General inventory query
       const targetLocationId = location_id ? buildGid("Location", location_id) : null;
+      let queryParts = [];
+      if (sku) {
+        queryParts.push(`sku:${sku}`);
+      }
 
-      const inventoryQuery = `
-        query GetInventoryLevels($first: Int!, $after: String, $query: String) {
-          inventoryItems(first: $first, after: $after, query: $query) {
-            edges {
-              node {
-                id
-                sku
-                variant {
-                  id
-                  title
-                  product {
-                    id
-                    title
-                  }
-                }
-                inventoryLevels(first: 10) {
-                  edges {
-                    node {
-                      id
-                      location {
-                        id
-                        name
-                      }
-                      quantities(names: ["available", "on_hand", "committed", "incoming"]) {
-                        name
-                        quantity
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            pageInfo {
-              hasNextPage
-              endCursor
-            }
-          }
-        }
-      `;
-
-      const data = await shopifyGraphQL(inventoryQuery, {
+      const data = await shopifyGraphQL(store, INVENTORY_LEVELS_QUERY, {
         first: limit,
         after: cursor || null,
         query: queryParts.length > 0 ? queryParts.join(" AND ") : null,
@@ -345,18 +337,224 @@ export function registerInventoryTools(server) {
     }
   );
 
-  // Update Inventory
-  server.tool(
-    "shopify_update_inventory",
+  // ============================================
+  // INVENTORY ADJUST - STAGED WORKFLOW
+  // ============================================
+
+  // Step 1: Plan inventory adjustment
+  server.registerTool(
+    "inventory_adjust_plan",
     {
-      title: "Update Shopify Inventory",
+      title: "Plan Inventory Adjustment",
       description:
-        "Adjust inventory quantity for a specific inventory item at a location. Use positive values to add, negative to subtract.",
+        "Plan an inventory adjustment. Creates a staged operation that must be previewed and executed.",
       inputSchema: {
-        inventory_item_id: z.string().describe("Inventory item ID (numeric ID or full GID)"),
-        location_id: z.string().describe("Location ID (numeric ID or full GID)"),
+        store: z.string().describe("Store name"),
+        inventory_item_id: z.string().describe("Inventory item ID"),
+        location_id: z.string().describe("Location ID"),
         adjustment: z.number().describe("Quantity adjustment (positive to add, negative to subtract)"),
         reason: z.string().optional().describe("Reason for adjustment"),
+        response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ store, inventory_item_id, location_id, adjustment, reason, response_format }) => {
+      requireStore(store);
+
+      // Get current inventory level
+      const inventoryItemGid = buildGid("InventoryItem", inventory_item_id);
+      const locationGid = buildGid("Location", location_id);
+
+      const itemsData = await shopifyGraphQL(store, INVENTORY_ITEMS_QUERY, {
+        ids: [inventoryItemGid],
+      });
+
+      if (!itemsData.nodes || itemsData.nodes.length === 0 || !itemsData.nodes[0]) {
+        return {
+          content: [{ type: "text", text: `Inventory item ${inventory_item_id} not found.` }],
+          isError: true,
+        };
+      }
+
+      const item = itemsData.nodes[0];
+      const level = item.inventoryLevels?.edges?.find(
+        (e) => e.node.location.id === locationGid
+      )?.node;
+
+      if (!level) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Inventory item ${inventory_item_id} is not tracked at location ${location_id}.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const currentAvailable = level.quantities.find((q) => q.name === "available")?.quantity || 0;
+
+      const payload = {
+        inventoryItemId: inventory_item_id,
+        locationId: location_id,
+        adjustment,
+        reason: reason || "correction",
+        currentState: {
+          sku: item.sku,
+          variant: item.variant?.title,
+          product: item.variant?.product?.title,
+          location: level.location.name,
+          currentAvailable,
+          newAvailable: currentAvailable + adjustment,
+        },
+      };
+
+      const result = workflowEngine.plan({
+        store,
+        operationType: OperationType.INVENTORY_ADJUST,
+        payload,
+        description: `Adjust inventory for ${item.sku || item.variant?.title || inventory_item_id} by ${adjustment > 0 ? "+" : ""}${adjustment}`,
+        affectedResources: [
+          `Inventory Item: ${item.sku || inventory_item_id}`,
+          `Location: ${level.location.name}`,
+        ],
+      });
+
+      if (response_format === "markdown") {
+        const prodWarning = isProduction(store)
+          ? "\n\n**WARNING: This targets a PRODUCTION store!**"
+          : "";
+
+        let md = `# Inventory Adjustment Planned\n\n`;
+        md += `**Operation ID:** \`${result.operationId}\`\n`;
+        md += `**Store:** ${result.store} (${result.storeEnvironment})${prodWarning}\n`;
+        md += `**State:** ${result.state}\n\n`;
+        md += `## Item Details\n`;
+        if (payload.currentState.product) md += `- **Product:** ${payload.currentState.product}\n`;
+        if (payload.currentState.variant) md += `- **Variant:** ${payload.currentState.variant}\n`;
+        if (payload.currentState.sku) md += `- **SKU:** ${payload.currentState.sku}\n`;
+        md += `- **Location:** ${payload.currentState.location}\n\n`;
+        md += `## Adjustment\n`;
+        md += `- **Current Available:** ${currentAvailable}\n`;
+        md += `- **Adjustment:** ${adjustment > 0 ? "+" : ""}${adjustment}\n`;
+        md += `- **New Available:** ${currentAvailable + adjustment}\n`;
+        if (reason) md += `- **Reason:** ${reason}\n`;
+        md += `\n## Next Step\n`;
+        md += `Call \`inventory_adjust_preview\` with \`operation_id: "${result.operationId}"\`\n`;
+
+        return { content: [{ type: "text", text: md }] };
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Step 2: Preview inventory adjustment
+  server.registerTool(
+    "inventory_adjust_preview",
+    {
+      title: "Preview Inventory Adjustment",
+      description: "Preview a planned inventory adjustment. Shows the before and after quantities.",
+      inputSchema: {
+        operation_id: z.string().describe("Operation ID from inventory_adjust_plan"),
+        response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ operation_id, response_format }) => {
+      const previewGenerator = async (operation) => {
+        // Fetch fresh current state
+        const inventoryItemGid = buildGid("InventoryItem", operation.payload.inventoryItemId);
+        const locationGid = buildGid("Location", operation.payload.locationId);
+
+        const itemsData = await shopifyGraphQL(operation.store, INVENTORY_ITEMS_QUERY, {
+          ids: [inventoryItemGid],
+        });
+
+        const item = itemsData.nodes?.[0];
+        const level = item?.inventoryLevels?.edges?.find(
+          (e) => e.node.location.id === locationGid
+        )?.node;
+
+        const freshCurrentAvailable = level?.quantities.find((q) => q.name === "available")?.quantity || 0;
+
+        return {
+          action: "ADJUST",
+          inventoryItemId: operation.payload.inventoryItemId,
+          locationId: operation.payload.locationId,
+          sku: item?.sku,
+          product: item?.variant?.product?.title,
+          variant: item?.variant?.title,
+          location: level?.location?.name,
+          adjustment: operation.payload.adjustment,
+          reason: operation.payload.reason,
+          currentState: {
+            available: freshCurrentAvailable,
+          },
+          newState: {
+            available: freshCurrentAvailable + operation.payload.adjustment,
+          },
+          summary: `Adjust available quantity from ${freshCurrentAvailable} to ${freshCurrentAvailable + operation.payload.adjustment}`,
+        };
+      };
+
+      const result = await workflowEngine.preview(operation_id, previewGenerator);
+
+      if (response_format === "markdown") {
+        let md = `# Inventory Adjustment Preview\n\n`;
+        md += `**Operation ID:** \`${result.operationId}\`\n`;
+        md += `**Store:** ${result.store}\n\n`;
+        md += `## Item\n`;
+        if (result.preview.product) md += `- **Product:** ${result.preview.product}\n`;
+        if (result.preview.variant) md += `- **Variant:** ${result.preview.variant}\n`;
+        if (result.preview.sku) md += `- **SKU:** ${result.preview.sku}\n`;
+        md += `- **Location:** ${result.preview.location}\n\n`;
+        md += `## Change\n`;
+        md += "| Quantity | Current | After |\n";
+        md += "|----------|---------|-------|\n";
+        md += `| Available | ${result.preview.currentState.available} | ${result.preview.newState.available} |\n`;
+        md += `\n**Adjustment:** ${result.preview.adjustment > 0 ? "+" : ""}${result.preview.adjustment}\n`;
+        md += `**Reason:** ${result.preview.reason}\n`;
+
+        if (result.warnings?.length > 0) {
+          md += `\n## Warnings\n`;
+          result.warnings.forEach((w) => {
+            md += `- ${w}\n`;
+          });
+        }
+
+        md += `\n## Next Step\n`;
+        md += `If approved, call \`inventory_adjust_execute\` with \`operation_id: "${result.operationId}"\`\n`;
+
+        return { content: [{ type: "text", text: md }] };
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Step 3: Execute inventory adjustment
+  server.registerTool(
+    "inventory_adjust_execute",
+    {
+      title: "Execute Inventory Adjustment",
+      description:
+        "Execute a previewed inventory adjustment. This actually changes the inventory. " +
+        "Production stores require confirm_production: true.",
+      inputSchema: {
+        operation_id: z.string().describe("Operation ID from inventory_adjust_plan"),
+        confirm_production: z.boolean().default(false).describe("Required for production stores"),
         response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
       },
       annotations: {
@@ -366,80 +564,98 @@ export function registerInventoryTools(server) {
         openWorldHint: true,
       },
     },
-    async ({ inventory_item_id, location_id, adjustment, reason, response_format }) => {
-      const mutation = `
-        mutation AdjustInventory($input: InventoryAdjustQuantitiesInput!) {
-          inventoryAdjustQuantities(input: $input) {
-            inventoryAdjustmentGroup {
-              reason
-              changes {
-                name
-                delta
-                quantityAfterChange
-              }
-            }
-            userErrors {
-              field
-              message
-              code
-            }
-          }
+    async ({ operation_id, confirm_production, response_format }) => {
+      const executor = async (operation) => {
+        const inventoryItemGid = buildGid("InventoryItem", operation.payload.inventoryItemId);
+        const locationGid = buildGid("Location", operation.payload.locationId);
+
+        const input = {
+          reason: operation.payload.reason,
+          name: "available",
+          changes: [
+            {
+              inventoryItemId: inventoryItemGid,
+              locationId: locationGid,
+              delta: operation.payload.adjustment,
+            },
+          ],
+        };
+
+        const data = await shopifyGraphQL(operation.store, INVENTORY_ADJUST_MUTATION, { input });
+
+        if (data.inventoryAdjustQuantities.userErrors?.length > 0) {
+          const errors = data.inventoryAdjustQuantities.userErrors
+            .map((e) => `${e.field || e.code}: ${e.message}`)
+            .join("; ");
+          throw new Error(`Failed to adjust inventory: ${errors}`);
         }
-      `;
 
-      const inventoryItemGid = buildGid("InventoryItem", inventory_item_id);
-      const locationGid = buildGid("Location", location_id);
+        const group = data.inventoryAdjustQuantities.inventoryAdjustmentGroup;
+        const change = group?.changes?.[0];
 
-      const input = {
-        reason: reason || "correction",
-        name: "available",
-        changes: [
-          {
-            inventoryItemId: inventoryItemGid,
-            locationId: locationGid,
-            delta: adjustment,
-          },
-        ],
+        return {
+          success: true,
+          inventoryItemId: parseGid(inventoryItemGid),
+          locationId: parseGid(locationGid),
+          reason: group?.reason,
+          adjustment: operation.payload.adjustment,
+          quantityAfterChange: change?.quantityAfterChange,
+        };
       };
 
-      const data = await shopifyGraphQL(mutation, { input });
+      // Fresh preview for state check
+      const freshPreviewGenerator = async (operation) => {
+        const inventoryItemGid = buildGid("InventoryItem", operation.payload.inventoryItemId);
+        const locationGid = buildGid("Location", operation.payload.locationId);
 
-      if (data.inventoryAdjustQuantities.userErrors?.length > 0) {
-        const errors = data.inventoryAdjustQuantities.userErrors
-          .map((e) => `${e.field || e.code}: ${e.message}`)
-          .join("; ");
+        const itemsData = await shopifyGraphQL(operation.store, INVENTORY_ITEMS_QUERY, {
+          ids: [inventoryItemGid],
+        });
+
+        const item = itemsData.nodes?.[0];
+        const level = item?.inventoryLevels?.edges?.find(
+          (e) => e.node.location.id === locationGid
+        )?.node;
+
         return {
-          content: [{ type: "text", text: `Failed to adjust inventory: ${errors}` }],
+          currentState: {
+            available: level?.quantities.find((q) => q.name === "available")?.quantity || 0,
+          },
+        };
+      };
+
+      try {
+        const result = await workflowEngine.execute(
+          operation_id,
+          confirm_production,
+          executor,
+          freshPreviewGenerator
+        );
+
+        if (response_format === "markdown") {
+          let md = `# Inventory Adjusted Successfully\n\n`;
+          md += `**Operation ID:** \`${result.operationId}\`\n`;
+          md += `**Store:** ${result.store}\n`;
+          md += `**Executed At:** ${result.executedAt}\n\n`;
+          md += `## Adjustment Details\n`;
+          md += `- **Inventory Item ID:** ${result.result.inventoryItemId}\n`;
+          md += `- **Location ID:** ${result.result.locationId}\n`;
+          md += `- **Adjustment:** ${result.result.adjustment > 0 ? "+" : ""}${result.result.adjustment}\n`;
+          md += `- **New Available Quantity:** ${result.result.quantityAfterChange}\n`;
+          if (result.result.reason) {
+            md += `- **Reason:** ${result.result.reason}\n`;
+          }
+
+          return { content: [{ type: "text", text: md }] };
+        }
+
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Execution failed: ${error.message}` }],
           isError: true,
         };
       }
-
-      const group = data.inventoryAdjustQuantities.inventoryAdjustmentGroup;
-      const change = group?.changes?.[0];
-
-      const result = {
-        message: "Inventory adjusted successfully",
-        inventoryItemId: parseGid(inventoryItemGid),
-        locationId: parseGid(locationGid),
-        reason: group?.reason,
-        adjustment,
-        quantityAfterChange: change?.quantityAfterChange,
-      };
-
-      if (response_format === "markdown") {
-        let md = `# Inventory Adjustment\n\n`;
-        md += `**Status:** Success\n`;
-        md += `**Inventory Item ID:** ${result.inventoryItemId}\n`;
-        md += `**Location ID:** ${result.locationId}\n`;
-        md += `**Adjustment:** ${adjustment > 0 ? "+" : ""}${adjustment}\n`;
-        md += `**New Available Quantity:** ${result.quantityAfterChange}\n`;
-        if (result.reason) {
-          md += `**Reason:** ${result.reason}\n`;
-        }
-        return { content: [{ type: "text", text: md }] };
-      }
-
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
 }

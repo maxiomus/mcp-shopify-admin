@@ -16,21 +16,35 @@ src/
 ├── shopify/
 │   └── client.js     # Shopify GraphQL client (axios-based)
 └── tools/
-    ├── index.js      # Tool registration hub
-    ├── products.js   # Product CRUD tools
-    ├── orders.js     # Order management tools
-    ├── customers.js  # Customer tools
-    └── inventory.js  # Inventory tools
+    ├── index.js         # Tool registration hub
+    ├── stores.js        # store_list
+    ├── operations.js    # Staged-operation inspection
+    ├── products.js      # Product CRUD tools
+    ├── tags.js          # Additive/subtractive tag tools (tagsAdd / tagsRemove)
+    ├── collections.js   # Collection read + create/update incl. ruleSet
+    ├── publications.js  # Sales-channel listing and publishing
+    ├── orders.js        # Order management tools
+    ├── customers.js     # Customer tools
+    └── inventory.js     # Inventory tools
 ```
 
 ## Key Patterns
 
 ### Tool Registration
 
-Tools are registered using the MCP SDK's `server.tool()` method:
+**Use `server.registerTool(name, config, cb)` — NOT `server.tool()`.**
+
+`server.tool()` is deprecated in SDK v1.25+, and its overloads expect a raw
+ZodRawShape as the second argument, not a config object. Passing a
+`{ title, description, inputSchema, annotations }` object to `server.tool()`
+makes the SDK treat those four keys as the parameter shape, which produces an
+**empty input schema** (`{"type":"object","properties":{}}`). Clients then strip
+every argument before sending, and each tool fails with confusing errors such as
+`Store "undefined" not found`. This bit the whole server once — every tool was
+silently unusable.
 
 ```javascript
-server.tool(
+server.registerTool(
   "tool_name",
   {
     title: "Human Title",
@@ -114,3 +128,41 @@ npx @modelcontextprotocol/inspector node src/index.js
 ```
 
 Or configure in Claude Desktop and test interactively.
+
+## Tag changes: always use the tag tools, never product_update
+
+`productUpdate(input: { tags: [...] })` **replaces the entire tag array**. Two
+jobs tagging overlapping products will overwrite each other (last writer wins),
+and any stale read destroys pre-existing tags. This happened in production on
+2026-08-04: a parallel tagging run across 13 overlapping collections destroyed
+the tag `may 26` on 34 products before it was caught and repaired.
+
+Use instead:
+
+- `product_tags_add_*` — Shopify `tagsAdd`, purely additive, safe to run in
+  parallel, immune to stale snapshots.
+- `product_tags_remove_*` — Shopify `tagsRemove`, removes only the named tags.
+
+`product_update` should only set `tags` when the intent is genuinely to replace
+the whole list.
+
+## Collections: MANUAL vs AUTOMATED matters for external feeds
+
+A Shopify collection with no `ruleSet` is MANUAL (hand-picked). Its membership
+is stored in a join table that product feeds do not carry, so **manual
+collection membership never reaches the Meta/Facebook catalog** — a product set
+filtered on that collection returns zero products even though the products
+themselves sync fine.
+
+An AUTOMATED collection defines membership by rule (e.g. `TAG EQUALS
+"or-cocktail-dresses"`), which is derivable from the product record and
+therefore does propagate.
+
+Workflow to make a manual collection advertisable:
+1. `product_tags_add_*` — tag the products already curated into it.
+2. `collection_update_*` with a `rule_set` of `TAG EQUALS <tag>` to convert it.
+3. If Shopify refuses the conversion, use `collection_create_*` to make an
+   automated twin and repoint downstream systems at the new collection ID.
+
+`collection_list` and `collection_get` report the `type` field (MANUAL /
+AUTOMATED) so this is visible at a glance.

@@ -1,5 +1,7 @@
 import { z } from "zod";
-import { shopifyGraphQL, buildGid, parseGid } from "../shopify/client.js";
+import { shopifyGraphQL, buildGid, parseGid } from "../stores/client.js";
+import { requireStore, isProduction } from "../stores/registry.js";
+import { workflowEngine, OperationType } from "../workflow/engine.js";
 
 /**
  * Format orders list response
@@ -181,15 +183,184 @@ function formatOrder(order, format) {
   return { content: [{ type: "text", text: JSON.stringify(o, null, 2) }] };
 }
 
+// GraphQL Queries
+const ORDER_LIST_QUERY = `
+  query ListOrders($first: Int!, $query: String, $after: String) {
+    orders(first: $first, query: $query, after: $after, sortKey: CREATED_AT, reverse: true) {
+      edges {
+        node {
+          id
+          name
+          email
+          createdAt
+          displayFinancialStatus
+          displayFulfillmentStatus
+          totalPriceSet {
+            shopMoney { amount currencyCode }
+          }
+          customer {
+            id
+            displayName
+          }
+          lineItems(first: 5) {
+            edges { node { id } }
+          }
+        }
+        cursor
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        endCursor
+        startCursor
+      }
+    }
+  }
+`;
+
+const ORDER_GET_QUERY = `
+  query GetOrder($id: ID!) {
+    order(id: $id) {
+      id
+      name
+      email
+      phone
+      createdAt
+      updatedAt
+      cancelledAt
+      cancelReason
+      displayFinancialStatus
+      displayFulfillmentStatus
+      totalPriceSet {
+        shopMoney { amount currencyCode }
+      }
+      subtotalPriceSet {
+        shopMoney { amount currencyCode }
+      }
+      totalTaxSet {
+        shopMoney { amount currencyCode }
+      }
+      customer {
+        id
+        displayName
+        email
+      }
+      shippingAddress {
+        name
+        address1
+        address2
+        city
+        province
+        country
+        zip
+      }
+      lineItems(first: 100) {
+        edges {
+          node {
+            id
+            title
+            quantity
+            sku
+            originalUnitPriceSet {
+              shopMoney { amount currencyCode }
+            }
+            variant {
+              id
+              title
+            }
+          }
+        }
+      }
+      fulfillments {
+        id
+        status
+        createdAt
+        trackingInfo {
+          number
+          company
+          url
+        }
+      }
+    }
+  }
+`;
+
+const FULFILLMENT_ORDERS_QUERY = `
+  query GetFulfillmentOrders($id: ID!) {
+    order(id: $id) {
+      id
+      name
+      fulfillmentOrders(first: 10) {
+        edges {
+          node {
+            id
+            status
+            lineItems(first: 100) {
+              edges {
+                node {
+                  id
+                  remainingQuantity
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const FULFILLMENT_CREATE_MUTATION = `
+  mutation FulfillOrder($fulfillment: FulfillmentV2Input!) {
+    fulfillmentCreateV2(fulfillment: $fulfillment) {
+      fulfillment {
+        id
+        status
+        createdAt
+        trackingInfo {
+          number
+          company
+          url
+        }
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+const ORDER_CANCEL_MUTATION = `
+  mutation CancelOrder($orderId: ID!, $reason: OrderCancelReason!, $restock: Boolean!, $notifyCustomer: Boolean!) {
+    orderCancel(orderId: $orderId, reason: $reason, restock: $restock, notifyCustomer: $notifyCustomer) {
+      job {
+        id
+        done
+      }
+      orderCancelUserErrors {
+        field
+        message
+        code
+      }
+    }
+  }
+`;
+
 export function registerOrderTools(server) {
+  // ============================================
+  // READ TOOLS (require store parameter)
+  // ============================================
+
   // List Orders
-  server.tool(
-    "shopify_list_orders",
+  server.registerTool(
+    "order_list",
     {
-      title: "List Shopify Orders",
+      title: "List Orders",
       description:
-        "List orders from your Shopify store with optional filtering by status and pagination.",
+        "List orders from a Shopify store with optional filtering by status and pagination.",
       inputSchema: {
+        store: z.string().describe("Store name (use store_list to see available stores)"),
         limit: z.number().min(1).max(250).default(50).describe("Number of orders to return (1-250)"),
         status: z
           .enum(["open", "closed", "cancelled", "any"])
@@ -222,7 +393,9 @@ export function registerOrderTools(server) {
         openWorldHint: true,
       },
     },
-    async ({ limit, status, financial_status, fulfillment_status, cursor, response_format }) => {
+    async ({ store, limit, status, financial_status, fulfillment_status, cursor, response_format }) => {
+      requireStore(store);
+
       // Build query string for filtering
       let queryParts = [];
       if (status && status !== "any") {
@@ -235,41 +408,7 @@ export function registerOrderTools(server) {
         queryParts.push(`fulfillment_status:${fulfillment_status}`);
       }
 
-      const gqlQuery = `
-        query ListOrders($first: Int!, $query: String, $after: String) {
-          orders(first: $first, query: $query, after: $after, sortKey: CREATED_AT, reverse: true) {
-            edges {
-              node {
-                id
-                name
-                email
-                createdAt
-                displayFinancialStatus
-                displayFulfillmentStatus
-                totalPriceSet {
-                  shopMoney { amount currencyCode }
-                }
-                customer {
-                  id
-                  displayName
-                }
-                lineItems(first: 5) {
-                  edges { node { id } }
-                }
-              }
-              cursor
-            }
-            pageInfo {
-              hasNextPage
-              hasPreviousPage
-              endCursor
-              startCursor
-            }
-          }
-        }
-      `;
-
-      const data = await shopifyGraphQL(gqlQuery, {
+      const data = await shopifyGraphQL(store, ORDER_LIST_QUERY, {
         first: limit,
         query: queryParts.length > 0 ? queryParts.join(" AND ") : null,
         after: cursor || null,
@@ -284,13 +423,14 @@ export function registerOrderTools(server) {
   );
 
   // Get Order
-  server.tool(
-    "shopify_get_order",
+  server.registerTool(
+    "order_get",
     {
-      title: "Get Shopify Order",
+      title: "Get Order",
       description:
-        "Get detailed information about a specific order by ID, including line items, fulfillments, and customer info.",
+        "Get detailed information about a specific order including line items, fulfillments, and customer info.",
       inputSchema: {
+        store: z.string().describe("Store name"),
         id: z.string().describe("Order ID (numeric ID or full GID)"),
         response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
       },
@@ -301,75 +441,10 @@ export function registerOrderTools(server) {
         openWorldHint: true,
       },
     },
-    async ({ id, response_format }) => {
-      const gqlQuery = `
-        query GetOrder($id: ID!) {
-          order(id: $id) {
-            id
-            name
-            email
-            phone
-            createdAt
-            updatedAt
-            cancelledAt
-            cancelReason
-            displayFinancialStatus
-            displayFulfillmentStatus
-            totalPriceSet {
-              shopMoney { amount currencyCode }
-            }
-            subtotalPriceSet {
-              shopMoney { amount currencyCode }
-            }
-            totalTaxSet {
-              shopMoney { amount currencyCode }
-            }
-            customer {
-              id
-              displayName
-              email
-            }
-            shippingAddress {
-              name
-              address1
-              address2
-              city
-              province
-              country
-              zip
-            }
-            lineItems(first: 100) {
-              edges {
-                node {
-                  id
-                  title
-                  quantity
-                  sku
-                  originalUnitPriceSet {
-                    shopMoney { amount currencyCode }
-                  }
-                  variant {
-                    id
-                    title
-                  }
-                }
-              }
-            }
-            fulfillments {
-              id
-              status
-              createdAt
-              trackingInfo {
-                number
-                company
-                url
-              }
-            }
-          }
-        }
-      `;
+    async ({ store, id, response_format }) => {
+      requireStore(store);
 
-      const data = await shopifyGraphQL(gqlQuery, {
+      const data = await shopifyGraphQL(store, ORDER_GET_QUERY, {
         id: buildGid("Order", id),
       });
 
@@ -384,14 +459,19 @@ export function registerOrderTools(server) {
     }
   );
 
-  // Fulfill Order
-  server.tool(
-    "shopify_fulfill_order",
+  // ============================================
+  // FULFILL ORDER - STAGED WORKFLOW
+  // ============================================
+
+  // Step 1: Plan order fulfillment
+  server.registerTool(
+    "order_fulfill_plan",
     {
-      title: "Fulfill Shopify Order",
+      title: "Plan Order Fulfillment",
       description:
-        "Create a fulfillment for an order. This marks items as shipped and optionally adds tracking information.",
+        "Plan an order fulfillment. This creates a staged operation that must be previewed and executed.",
       inputSchema: {
+        store: z.string().describe("Store name"),
         order_id: z.string().describe("Order ID (numeric ID or full GID)"),
         tracking_number: z.string().optional().describe("Tracking number"),
         tracking_company: z.string().optional().describe("Shipping carrier name"),
@@ -401,39 +481,16 @@ export function registerOrderTools(server) {
       },
       annotations: {
         readOnlyHint: false,
-        destructiveHint: true,
+        destructiveHint: false,
         idempotentHint: false,
         openWorldHint: true,
       },
     },
-    async ({ order_id, tracking_number, tracking_company, tracking_url, notify_customer, response_format }) => {
-      // First, get the fulfillment order ID
-      const getOrderQuery = `
-        query GetFulfillmentOrders($id: ID!) {
-          order(id: $id) {
-            id
-            name
-            fulfillmentOrders(first: 10) {
-              edges {
-                node {
-                  id
-                  status
-                  lineItems(first: 100) {
-                    edges {
-                      node {
-                        id
-                        remainingQuantity
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `;
+    async ({ store, order_id, tracking_number, tracking_company, tracking_url, notify_customer, response_format }) => {
+      requireStore(store);
 
-      const orderData = await shopifyGraphQL(getOrderQuery, {
+      // Verify order exists and check fulfillment status
+      const orderData = await shopifyGraphQL(store, FULFILLMENT_ORDERS_QUERY, {
         id: buildGid("Order", order_id),
       });
 
@@ -463,7 +520,6 @@ export function registerOrderTools(server) {
         };
       }
 
-      // Build fulfillment input
       const fulfillmentOrderLineItems = fulfillableOrders[0].node.lineItems.edges
         .filter((e) => e.node.remainingQuantity > 0)
         .map((e) => ({
@@ -471,89 +527,43 @@ export function registerOrderTools(server) {
           quantity: e.node.remainingQuantity,
         }));
 
-      const mutation = `
-        mutation FulfillOrder($fulfillment: FulfillmentV2Input!) {
-          fulfillmentCreateV2(fulfillment: $fulfillment) {
-            fulfillment {
-              id
-              status
-              createdAt
-              trackingInfo {
-                number
-                company
-                url
-              }
-            }
-            userErrors {
-              field
-              message
-            }
-          }
-        }
-      `;
-
-      const trackingInfo =
-        tracking_number || tracking_company || tracking_url
-          ? {
-              number: tracking_number,
-              company: tracking_company,
-              url: tracking_url,
-            }
-          : null;
-
-      const fulfillmentInput = {
-        lineItemsByFulfillmentOrder: [
-          {
-            fulfillmentOrderId: fulfillableOrders[0].node.id,
-            fulfillmentOrderLineItems,
-          },
-        ],
+      const payload = {
+        orderId: order_id,
+        orderName: orderData.order.name,
+        fulfillmentOrderId: fulfillableOrders[0].node.id,
+        fulfillmentOrderLineItems,
+        trackingNumber: tracking_number,
+        trackingCompany: tracking_company,
+        trackingUrl: tracking_url,
         notifyCustomer: notify_customer,
       };
 
-      if (trackingInfo) {
-        fulfillmentInput.trackingInfo = trackingInfo;
-      }
-
-      const data = await shopifyGraphQL(mutation, {
-        fulfillment: fulfillmentInput,
+      const result = workflowEngine.plan({
+        store,
+        operationType: OperationType.ORDER_FULFILL,
+        payload,
+        description: `Fulfill order ${orderData.order.name}`,
+        affectedResources: [`Order: ${orderData.order.name} (${order_id})`],
       });
 
-      if (data.fulfillmentCreateV2.userErrors?.length > 0) {
-        const errors = data.fulfillmentCreateV2.userErrors
-          .map((e) => `${e.field}: ${e.message}`)
-          .join("; ");
-        return {
-          content: [{ type: "text", text: `Failed to create fulfillment: ${errors}` }],
-          isError: true,
-        };
-      }
-
-      const f = data.fulfillmentCreateV2.fulfillment;
-      const result = {
-        message: `Fulfillment created successfully for order ${orderData.order.name}`,
-        fulfillment: {
-          id: parseGid(f.id),
-          status: f.status,
-          createdAt: f.createdAt,
-          trackingInfo: f.trackingInfo,
-        },
-      };
-
       if (response_format === "markdown") {
-        let md = `# Fulfillment Created\n\n`;
-        md += `**Order:** ${orderData.order.name}\n`;
-        md += `**Fulfillment ID:** ${result.fulfillment.id}\n`;
-        md += `**Status:** ${result.fulfillment.status}\n`;
-        md += `**Created:** ${result.fulfillment.createdAt}\n`;
-        if (result.fulfillment.trackingInfo?.length) {
-          md += `\n## Tracking\n`;
-          result.fulfillment.trackingInfo.forEach((t) => {
-            md += `- **Number:** ${t.number || "-"}\n`;
-            md += `- **Company:** ${t.company || "-"}\n`;
-            if (t.url) md += `- **URL:** ${t.url}\n`;
-          });
-        }
+        const prodWarning = isProduction(store)
+          ? "\n\n**WARNING: This targets a PRODUCTION store!**"
+          : "";
+
+        let md = `# Order Fulfillment Planned\n\n`;
+        md += `**Operation ID:** \`${result.operationId}\`\n`;
+        md += `**Store:** ${result.store} (${result.storeEnvironment})${prodWarning}\n`;
+        md += `**State:** ${result.state}\n\n`;
+        md += `## Order Details\n`;
+        md += `- **Order:** ${orderData.order.name}\n`;
+        md += `- **Items to Fulfill:** ${fulfillmentOrderLineItems.length}\n`;
+        md += `- **Notify Customer:** ${notify_customer ? "Yes" : "No"}\n`;
+        if (tracking_number) md += `- **Tracking Number:** ${tracking_number}\n`;
+        if (tracking_company) md += `- **Carrier:** ${tracking_company}\n`;
+        md += `\n## Next Step\n`;
+        md += `Call \`order_fulfill_preview\` with \`operation_id: "${result.operationId}"\`\n`;
+
         return { content: [{ type: "text", text: md }] };
       }
 
@@ -561,15 +571,187 @@ export function registerOrderTools(server) {
     }
   );
 
-  // Cancel Order
-  server.tool(
-    "shopify_cancel_order",
+  // Step 2: Preview order fulfillment
+  server.registerTool(
+    "order_fulfill_preview",
     {
-      title: "Cancel Shopify Order",
-      description:
-        "Cancel an order. This will void any pending payments and can optionally restock items and send notification.",
+      title: "Preview Order Fulfillment",
+      description: "Preview a planned order fulfillment. Shows what will be shipped.",
       inputSchema: {
-        id: z.string().describe("Order ID (numeric ID or full GID)"),
+        operation_id: z.string().describe("Operation ID from order_fulfill_plan"),
+        response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ operation_id, response_format }) => {
+      const previewGenerator = async (operation) => {
+        return {
+          action: "FULFILL",
+          orderName: operation.payload.orderName,
+          itemCount: operation.payload.fulfillmentOrderLineItems.length,
+          tracking: {
+            number: operation.payload.trackingNumber || "Not provided",
+            company: operation.payload.trackingCompany || "Not provided",
+            url: operation.payload.trackingUrl || "Not provided",
+          },
+          notifyCustomer: operation.payload.notifyCustomer,
+          summary: `Will fulfill ${operation.payload.fulfillmentOrderLineItems.length} item(s) for order ${operation.payload.orderName}`,
+        };
+      };
+
+      const result = await workflowEngine.preview(operation_id, previewGenerator);
+
+      if (response_format === "markdown") {
+        let md = `# Order Fulfillment Preview\n\n`;
+        md += `**Operation ID:** \`${result.operationId}\`\n`;
+        md += `**Store:** ${result.store}\n`;
+        md += `**Order:** ${result.preview.orderName}\n\n`;
+        md += `## Fulfillment Details\n`;
+        md += `- **Items to Fulfill:** ${result.preview.itemCount}\n`;
+        md += `- **Tracking Number:** ${result.preview.tracking.number}\n`;
+        md += `- **Carrier:** ${result.preview.tracking.company}\n`;
+        md += `- **Notify Customer:** ${result.preview.notifyCustomer ? "Yes" : "No"}\n\n`;
+
+        if (result.warnings?.length > 0) {
+          md += `## Warnings\n`;
+          result.warnings.forEach((w) => {
+            md += `- ${w}\n`;
+          });
+        }
+
+        md += `\n## Next Step\n`;
+        md += `If approved, call \`order_fulfill_execute\` with \`operation_id: "${result.operationId}"\`\n`;
+
+        return { content: [{ type: "text", text: md }] };
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Step 3: Execute order fulfillment
+  server.registerTool(
+    "order_fulfill_execute",
+    {
+      title: "Execute Order Fulfillment",
+      description:
+        "Execute a previewed order fulfillment. This marks items as shipped. " +
+        "Production stores require confirm_production: true.",
+      inputSchema: {
+        operation_id: z.string().describe("Operation ID from order_fulfill_plan"),
+        confirm_production: z.boolean().default(false).describe("Required for production stores"),
+        response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ operation_id, confirm_production, response_format }) => {
+      const executor = async (operation) => {
+        const trackingInfo =
+          operation.payload.trackingNumber ||
+          operation.payload.trackingCompany ||
+          operation.payload.trackingUrl
+            ? {
+                number: operation.payload.trackingNumber,
+                company: operation.payload.trackingCompany,
+                url: operation.payload.trackingUrl,
+              }
+            : null;
+
+        const fulfillmentInput = {
+          lineItemsByFulfillmentOrder: [
+            {
+              fulfillmentOrderId: operation.payload.fulfillmentOrderId,
+              fulfillmentOrderLineItems: operation.payload.fulfillmentOrderLineItems,
+            },
+          ],
+          notifyCustomer: operation.payload.notifyCustomer,
+        };
+
+        if (trackingInfo) {
+          fulfillmentInput.trackingInfo = trackingInfo;
+        }
+
+        const data = await shopifyGraphQL(operation.store, FULFILLMENT_CREATE_MUTATION, {
+          fulfillment: fulfillmentInput,
+        });
+
+        if (data.fulfillmentCreateV2.userErrors?.length > 0) {
+          const errors = data.fulfillmentCreateV2.userErrors
+            .map((e) => `${e.field}: ${e.message}`)
+            .join("; ");
+          throw new Error(`Failed to create fulfillment: ${errors}`);
+        }
+
+        const f = data.fulfillmentCreateV2.fulfillment;
+        return {
+          success: true,
+          fulfillment: {
+            id: parseGid(f.id),
+            status: f.status,
+            createdAt: f.createdAt,
+            trackingInfo: f.trackingInfo,
+          },
+        };
+      };
+
+      try {
+        const result = await workflowEngine.execute(operation_id, confirm_production, executor);
+
+        if (response_format === "markdown") {
+          let md = `# Order Fulfilled Successfully\n\n`;
+          md += `**Operation ID:** \`${result.operationId}\`\n`;
+          md += `**Store:** ${result.store}\n`;
+          md += `**Executed At:** ${result.executedAt}\n\n`;
+          md += `## Fulfillment Details\n`;
+          md += `- **Fulfillment ID:** ${result.result.fulfillment.id}\n`;
+          md += `- **Status:** ${result.result.fulfillment.status}\n`;
+          md += `- **Created:** ${result.result.fulfillment.createdAt}\n`;
+          if (result.result.fulfillment.trackingInfo?.length) {
+            md += `\n### Tracking\n`;
+            result.result.fulfillment.trackingInfo.forEach((t) => {
+              md += `- **Number:** ${t.number || "-"}\n`;
+              md += `- **Company:** ${t.company || "-"}\n`;
+              if (t.url) md += `- **URL:** ${t.url}\n`;
+            });
+          }
+
+          return { content: [{ type: "text", text: md }] };
+        }
+
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Execution failed: ${error.message}` }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // ============================================
+  // CANCEL ORDER - STAGED WORKFLOW
+  // ============================================
+
+  // Step 1: Plan order cancellation
+  server.registerTool(
+    "order_cancel_plan",
+    {
+      title: "Plan Order Cancellation",
+      description:
+        "Plan an order cancellation. This creates a staged operation that must be previewed and executed.",
+      inputSchema: {
+        store: z.string().describe("Store name"),
+        order_id: z.string().describe("Order ID (numeric ID or full GID)"),
         reason: z
           .enum(["CUSTOMER", "FRAUD", "INVENTORY", "DECLINED", "OTHER"])
           .default("OTHER")
@@ -580,64 +762,226 @@ export function registerOrderTools(server) {
       },
       annotations: {
         readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ store, order_id, reason, restock, notify_customer, response_format }) => {
+      requireStore(store);
+
+      // Verify order exists
+      const orderData = await shopifyGraphQL(store, ORDER_GET_QUERY, {
+        id: buildGid("Order", order_id),
+      });
+
+      if (!orderData.order) {
+        return {
+          content: [{ type: "text", text: `Order with ID ${order_id} not found.` }],
+          isError: true,
+        };
+      }
+
+      if (orderData.order.cancelledAt) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Order ${orderData.order.name} is already cancelled.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      const payload = {
+        orderId: order_id,
+        orderName: orderData.order.name,
+        reason,
+        restock,
+        notifyCustomer: notify_customer,
+        currentStatus: {
+          financial: orderData.order.displayFinancialStatus,
+          fulfillment: orderData.order.displayFulfillmentStatus,
+        },
+      };
+
+      const result = workflowEngine.plan({
+        store,
+        operationType: OperationType.ORDER_CANCEL,
+        payload,
+        description: `Cancel order ${orderData.order.name}`,
+        affectedResources: [`Order: ${orderData.order.name} (${order_id})`],
+      });
+
+      if (response_format === "markdown") {
+        const prodWarning = isProduction(store)
+          ? "\n\n**WARNING: This targets a PRODUCTION store!**"
+          : "";
+
+        let md = `# Order Cancellation Planned\n\n`;
+        md += `**Operation ID:** \`${result.operationId}\`\n`;
+        md += `**Store:** ${result.store} (${result.storeEnvironment})${prodWarning}\n`;
+        md += `**State:** ${result.state}\n\n`;
+        md += `## Order Details\n`;
+        md += `- **Order:** ${orderData.order.name}\n`;
+        md += `- **Financial Status:** ${orderData.order.displayFinancialStatus}\n`;
+        md += `- **Fulfillment Status:** ${orderData.order.displayFulfillmentStatus}\n\n`;
+        md += `## Cancellation Options\n`;
+        md += `- **Reason:** ${reason}\n`;
+        md += `- **Restock Items:** ${restock ? "Yes" : "No"}\n`;
+        md += `- **Notify Customer:** ${notify_customer ? "Yes" : "No"}\n`;
+        md += `\n## Next Step\n`;
+        md += `Call \`order_cancel_preview\` with \`operation_id: "${result.operationId}"\`\n`;
+
+        return { content: [{ type: "text", text: md }] };
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Step 2: Preview order cancellation
+  server.registerTool(
+    "order_cancel_preview",
+    {
+      title: "Preview Order Cancellation",
+      description: "Preview a planned order cancellation. Shows what will happen.",
+      inputSchema: {
+        operation_id: z.string().describe("Operation ID from order_cancel_plan"),
+        response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ operation_id, response_format }) => {
+      const previewGenerator = async (operation) => {
+        return {
+          action: "CANCEL",
+          orderName: operation.payload.orderName,
+          reason: operation.payload.reason,
+          restock: operation.payload.restock,
+          notifyCustomer: operation.payload.notifyCustomer,
+          currentStatus: operation.payload.currentStatus,
+          effects: [
+            "Order will be marked as cancelled",
+            operation.payload.restock
+              ? "Inventory will be restocked"
+              : "Inventory will NOT be restocked",
+            operation.payload.notifyCustomer
+              ? "Customer will receive cancellation email"
+              : "Customer will NOT be notified",
+          ],
+          summary: `Will cancel order ${operation.payload.orderName} with reason: ${operation.payload.reason}`,
+        };
+      };
+
+      const result = await workflowEngine.preview(operation_id, previewGenerator);
+
+      if (response_format === "markdown") {
+        let md = `# Order Cancellation Preview\n\n`;
+        md += `**Operation ID:** \`${result.operationId}\`\n`;
+        md += `**Store:** ${result.store}\n`;
+        md += `**Order:** ${result.preview.orderName}\n\n`;
+        md += `## Current Status\n`;
+        md += `- **Financial:** ${result.preview.currentStatus.financial}\n`;
+        md += `- **Fulfillment:** ${result.preview.currentStatus.fulfillment}\n\n`;
+        md += `## Effects of Cancellation\n`;
+        result.preview.effects.forEach((e) => {
+          md += `- ${e}\n`;
+        });
+
+        if (result.warnings?.length > 0) {
+          md += `\n## Warnings\n`;
+          result.warnings.forEach((w) => {
+            md += `- ${w}\n`;
+          });
+        }
+
+        md += `\n## Next Step\n`;
+        md += `If approved, call \`order_cancel_execute\` with \`operation_id: "${result.operationId}"\`\n`;
+
+        return { content: [{ type: "text", text: md }] };
+      }
+
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  // Step 3: Execute order cancellation
+  server.registerTool(
+    "order_cancel_execute",
+    {
+      title: "Execute Order Cancellation",
+      description:
+        "Execute a previewed order cancellation. This actually cancels the order. " +
+        "Production stores require confirm_production: true.",
+      inputSchema: {
+        operation_id: z.string().describe("Operation ID from order_cancel_plan"),
+        confirm_production: z.boolean().default(false).describe("Required for production stores"),
+        response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
+      },
+      annotations: {
+        readOnlyHint: false,
         destructiveHint: true,
         idempotentHint: false,
         openWorldHint: true,
       },
     },
-    async ({ id, reason, restock, notify_customer, response_format }) => {
-      const mutation = `
-        mutation CancelOrder($orderId: ID!, $reason: OrderCancelReason!, $restock: Boolean!, $notifyCustomer: Boolean!) {
-          orderCancel(orderId: $orderId, reason: $reason, restock: $restock, notifyCustomer: $notifyCustomer) {
-            job {
-              id
-              done
-            }
-            orderCancelUserErrors {
-              field
-              message
-              code
-            }
-          }
+    async ({ operation_id, confirm_production, response_format }) => {
+      const executor = async (operation) => {
+        const data = await shopifyGraphQL(operation.store, ORDER_CANCEL_MUTATION, {
+          orderId: buildGid("Order", operation.payload.orderId),
+          reason: operation.payload.reason,
+          restock: operation.payload.restock,
+          notifyCustomer: operation.payload.notifyCustomer,
+        });
+
+        if (data.orderCancel.orderCancelUserErrors?.length > 0) {
+          const errors = data.orderCancel.orderCancelUserErrors
+            .map((e) => `${e.field || e.code}: ${e.message}`)
+            .join("; ");
+          throw new Error(`Failed to cancel order: ${errors}`);
         }
-      `;
 
-      const data = await shopifyGraphQL(mutation, {
-        orderId: buildGid("Order", id),
-        reason,
-        restock,
-        notifyCustomer: notify_customer,
-      });
-
-      if (data.orderCancel.orderCancelUserErrors?.length > 0) {
-        const errors = data.orderCancel.orderCancelUserErrors
-          .map((e) => `${e.field || e.code}: ${e.message}`)
-          .join("; ");
         return {
-          content: [{ type: "text", text: `Failed to cancel order: ${errors}` }],
+          success: true,
+          jobId: data.orderCancel.job?.id ? parseGid(data.orderCancel.job.id) : null,
+          done: data.orderCancel.job?.done,
+          reason: operation.payload.reason,
+          restocked: operation.payload.restock,
+          notifiedCustomer: operation.payload.notifyCustomer,
+        };
+      };
+
+      try {
+        const result = await workflowEngine.execute(operation_id, confirm_production, executor);
+
+        if (response_format === "markdown") {
+          let md = `# Order Cancelled Successfully\n\n`;
+          md += `**Operation ID:** \`${result.operationId}\`\n`;
+          md += `**Store:** ${result.store}\n`;
+          md += `**Executed At:** ${result.executedAt}\n\n`;
+          md += `## Cancellation Details\n`;
+          md += `- **Status:** ${result.result.done ? "Completed" : "Processing"}\n`;
+          md += `- **Reason:** ${result.result.reason}\n`;
+          md += `- **Restocked:** ${result.result.restocked ? "Yes" : "No"}\n`;
+          md += `- **Customer Notified:** ${result.result.notifiedCustomer ? "Yes" : "No"}\n`;
+
+          return { content: [{ type: "text", text: md }] };
+        }
+
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `Execution failed: ${error.message}` }],
           isError: true,
         };
       }
-
-      const result = {
-        message: `Order cancellation initiated successfully`,
-        jobId: data.orderCancel.job?.id ? parseGid(data.orderCancel.job.id) : null,
-        done: data.orderCancel.job?.done,
-        reason,
-        restocked: restock,
-        notifiedCustomer: notify_customer,
-      };
-
-      if (response_format === "markdown") {
-        let md = `# Order Cancellation\n\n`;
-        md += `**Status:** ${result.done ? "Completed" : "Processing"}\n`;
-        md += `**Reason:** ${result.reason}\n`;
-        md += `**Restocked:** ${result.restocked ? "Yes" : "No"}\n`;
-        md += `**Customer Notified:** ${result.notifiedCustomer ? "Yes" : "No"}\n`;
-        return { content: [{ type: "text", text: md }] };
-      }
-
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     }
   );
 }

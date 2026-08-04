@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { shopifyGraphQL, buildGid, parseGid } from "../shopify/client.js";
+import { shopifyGraphQL, buildGid, parseGid } from "../stores/client.js";
+import { requireStore } from "../stores/registry.js";
 
 /**
  * Format customers list response
@@ -142,17 +143,98 @@ function formatCustomer(customer, format) {
   return { content: [{ type: "text", text: JSON.stringify(c, null, 2) }] };
 }
 
+// GraphQL Queries
+const CUSTOMER_LIST_QUERY = `
+  query ListCustomers($first: Int!, $query: String, $after: String) {
+    customers(first: $first, query: $query, after: $after) {
+      edges {
+        node {
+          id
+          displayName
+          email
+          phone
+          createdAt
+          updatedAt
+          ordersCount
+          totalSpentV2 {
+            amount
+            currencyCode
+          }
+          state
+          tags
+        }
+        cursor
+      }
+      pageInfo {
+        hasNextPage
+        hasPreviousPage
+        endCursor
+        startCursor
+      }
+    }
+  }
+`;
+
+const CUSTOMER_GET_QUERY = `
+  query GetCustomer($id: ID!) {
+    customer(id: $id) {
+      id
+      displayName
+      firstName
+      lastName
+      email
+      phone
+      createdAt
+      updatedAt
+      ordersCount
+      totalSpentV2 {
+        amount
+        currencyCode
+      }
+      state
+      tags
+      note
+      verifiedEmail
+      taxExempt
+      defaultAddress {
+        address1
+        address2
+        city
+        province
+        country
+        zip
+        phone
+      }
+      orders(first: 10, sortKey: CREATED_AT, reverse: true) {
+        edges {
+          node {
+            id
+            name
+            createdAt
+            displayFinancialStatus
+            displayFulfillmentStatus
+            totalPriceSet {
+              shopMoney { amount currencyCode }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
 export function registerCustomerTools(server) {
   // List Customers
-  server.tool(
-    "shopify_list_customers",
+  server.registerTool(
+    "customer_list",
     {
-      title: "List Shopify Customers",
+      title: "List Customers",
       description:
-        "List customers from your Shopify store with optional search and pagination.",
+        "List customers from a Shopify store with optional search and pagination.",
       inputSchema: {
+        store: z.string().describe("Store name (use store_list to see available stores)"),
         limit: z.number().min(1).max(250).default(50).describe("Number of customers to return (1-250)"),
-        query: z.string().optional().describe("Search query to filter customers (e.g., 'email:john@example.com' or 'tag:vip')"),
+        query: z.string().optional().describe("Search query (e.g., 'email:john@example.com' or 'tag:vip')"),
         cursor: z.string().optional().describe("Pagination cursor from previous response"),
         response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
       },
@@ -163,39 +245,10 @@ export function registerCustomerTools(server) {
         openWorldHint: true,
       },
     },
-    async ({ limit, query, cursor, response_format }) => {
-      const gqlQuery = `
-        query ListCustomers($first: Int!, $query: String, $after: String) {
-          customers(first: $first, query: $query, after: $after) {
-            edges {
-              node {
-                id
-                displayName
-                email
-                phone
-                createdAt
-                updatedAt
-                ordersCount
-                totalSpentV2 {
-                  amount
-                  currencyCode
-                }
-                state
-                tags
-              }
-              cursor
-            }
-            pageInfo {
-              hasNextPage
-              hasPreviousPage
-              endCursor
-              startCursor
-            }
-          }
-        }
-      `;
+    async ({ store, limit, query, cursor, response_format }) => {
+      requireStore(store);
 
-      const data = await shopifyGraphQL(gqlQuery, {
+      const data = await shopifyGraphQL(store, CUSTOMER_LIST_QUERY, {
         first: limit,
         query: query || null,
         after: cursor || null,
@@ -210,13 +263,14 @@ export function registerCustomerTools(server) {
   );
 
   // Get Customer
-  server.tool(
-    "shopify_get_customer",
+  server.registerTool(
+    "customer_get",
     {
-      title: "Get Shopify Customer",
+      title: "Get Customer",
       description:
-        "Get detailed information about a specific customer by ID, including their address and recent orders.",
+        "Get detailed information about a specific customer including their address and recent orders.",
       inputSchema: {
+        store: z.string().describe("Store name"),
         id: z.string().describe("Customer ID (numeric ID or full GID)"),
         response_format: z.enum(["json", "markdown"]).default("json").describe("Response format"),
       },
@@ -227,56 +281,10 @@ export function registerCustomerTools(server) {
         openWorldHint: true,
       },
     },
-    async ({ id, response_format }) => {
-      const gqlQuery = `
-        query GetCustomer($id: ID!) {
-          customer(id: $id) {
-            id
-            displayName
-            firstName
-            lastName
-            email
-            phone
-            createdAt
-            updatedAt
-            ordersCount
-            totalSpentV2 {
-              amount
-              currencyCode
-            }
-            state
-            tags
-            note
-            verifiedEmail
-            taxExempt
-            defaultAddress {
-              address1
-              address2
-              city
-              province
-              country
-              zip
-              phone
-            }
-            orders(first: 10, sortKey: CREATED_AT, reverse: true) {
-              edges {
-                node {
-                  id
-                  name
-                  createdAt
-                  displayFinancialStatus
-                  displayFulfillmentStatus
-                  totalPriceSet {
-                    shopMoney { amount currencyCode }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `;
+    async ({ store, id, response_format }) => {
+      requireStore(store);
 
-      const data = await shopifyGraphQL(gqlQuery, {
+      const data = await shopifyGraphQL(store, CUSTOMER_GET_QUERY, {
         id: buildGid("Customer", id),
       });
 

@@ -1,0 +1,23 @@
+{
+  "stores": [
+    {
+      "name": "production",
+      "domain": "your-brand.myshopify.com",
+      "accessToken": "shpat_your_production_token",
+      "environment": "production"
+    },
+    {
+      "name": "staging",
+      "domain": "your-brand-staging.myshopify.com",
+      "accessToken": "shpat_your_staging_token",
+      "environment": "staging"
+    },
+    {
+      "name": "development",
+      "domain": "your-brand-dev.myshopify.com",
+      "accessToken": "shpat_your_dev_token",
+      "environment": "development"
+    }
+  ],
+  "defaultStore": "staging"
+}
