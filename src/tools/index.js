@@ -7,6 +7,7 @@ import { registerOperationTools } from "./operations.js";
 import { registerCollectionTools } from "./collections.js";
 import { registerPublicationTools } from "./publications.js";
 import { registerTagTools } from "./tags.js";
+import { registerSalesWindowTools } from "./sales-window.js";
 
 /**
  * Register all Shopify tools with the MCP server
@@ -22,4 +23,5 @@ export function registerTools(server) {
   registerOrderTools(server);
   registerCustomerTools(server);
   registerInventoryTools(server);
+  registerSalesWindowTools(server);
 }
